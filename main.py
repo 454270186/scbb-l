@@ -3,6 +3,7 @@ import numpy as np
 import random
 import time
 from collections import defaultdict
+import matplotlib.pyplot as plt
 
 # --- Constants and Parameters ---
 NUM_NODES = 20  # NY-20 topology
@@ -19,23 +20,19 @@ BANDWIDTH_DEMAND = [1, 2, 3, 4, 5]  # Mbps
 COMP_LATENCY_PER_CORE = 0.01  # ms/CPU core
 PEP_VERIFY_LATENCY = 0.5  # ms
 VPEP_VERIFY_LATENCY = 0.02  # ms/Mbps
-NUM_NETWORKS = 5
+NUM_NETWORKS = 10
 NUM_AI_SRS_PER_NETWORK = 4000
 
 # --- Helper Functions ---
 def generate_network():
-    # Create a random graph (approximating NY-20 topology)
     G = nx.erdos_renyi_graph(NUM_NODES, 0.3, directed=True)
-    
-    # Assign node types: S (PESes), Q (PEPs), X (AIGC servers)
     nodes = list(G.nodes)
     random.shuffle(nodes)
     num_peps = random.randint(*NUM_PEPS_RANGE)
-    X = nodes[:NUM_AIGC_SERVERS]  # AIGC servers
-    Q = nodes[NUM_AIGC_SERVERS:NUM_AIGC_SERVERS + num_peps]  # PEPs
-    S = nodes[NUM_AIGC_SERVERS + num_peps:]  # PESes
+    X = nodes[:NUM_AIGC_SERVERS]
+    Q = nodes[NUM_AIGC_SERVERS:NUM_AIGC_SERVERS + num_peps]
+    S = nodes[NUM_AIGC_SERVERS + num_peps:]
     
-    # Assign attributes to nodes
     for node in G.nodes:
         if node in S:
             G.nodes[node]['type'] = 'PES'
@@ -46,38 +43,31 @@ def generate_network():
         else:
             G.nodes[node]['type'] = 'AIGC'
     
-    # Assign attributes to edges
     for u, v in G.edges():
-        G.edges[u, v]['bandwidth'] = random.choice(LINK_BANDWIDTHS)  # Gbps
+        G.edges[u, v]['bandwidth'] = random.choice(LINK_BANDWIDTHS)
         G.edges[u, v]['weight'] = random.uniform(*LINK_WEIGHTS)
     
     return G, S, Q, X
 
 def generate_ai_sr(G, S):
-    # Generate an AI-SR with a prompt chain
     chain_length = random.randint(*PROMPT_CHAIN_LENGTHS)
-    PrC = list(range(chain_length))  # Prompts p_0, p_1, ..., p_{chain_length-1}
-    d_v = [2 for _ in PrC]  # Data volume: 2 Mbps for simplicity
-    BW = random.choice(BANDWIDTH_DEMAND)  # Bandwidth demand
-    prompt_types = [random.randint(1, 7) for _ in PrC]  # Assign prompt types
-    c_v = [random.uniform(*PROMPT_COMP_DEMAND) for _ in PrC]  # Computational demand
-    
-    # Select source node (from S)
+    PrC = list(range(chain_length))
+    d_v = [2 for _ in PrC]
+    BW = random.choice(BANDWIDTH_DEMAND)
+    prompt_types = [random.randint(1, 7) for _ in PrC]
+    c_v = [random.uniform(*PROMPT_COMP_DEMAND) for _ in PrC]
     source = random.choice(S)
     return {'PrC': PrC, 'd_v': d_v, 'BW': BW, 'prompt_types': prompt_types, 'c_v': c_v, 'source': source}
 
 def compute_transmission_latency(G, path, d_v, BW):
-    # Compute transmission latency along a path
     if not path:
         return 0
     total_latency = 0
     for i in range(len(path) - 1):
         u, v = path[i], path[i + 1]
         if (u, v) in G.edges():
-            bw = G.edges[u, v]['bandwidth']  # Gbps
-            # Convert Gbps to Mbps for consistency: 1 Gbps = 1000 Mbps
-            # Latency = data volume / bandwidth (ms), approximated
-            latency = (d_v / (bw * 1000)) * 1000  # Convert to ms
+            bw = G.edges[u, v]['bandwidth']
+            latency = (d_v / (bw * 1000)) * 1000
             total_latency += latency
     return total_latency
 
@@ -90,19 +80,14 @@ def scbb_l(G, S, Q, X, ai_sr):
     c_v = ai_sr['c_v']
     source = ai_sr['source']
     
-    # Track remaining capacity of PESes
     remaining_capacity = {n: G.nodes[n]['capacity'] for n in S}
-    
-    # Initialize forwarding path
     For_Path = [source]
-    i = 1  # Start after p_0 (source)
+    i = 1
     n_last = source
-    PrC = PrC[1:]  # Remove p_0
+    PrC = PrC[1:]
     d_v = d_v[1:]
     prompt_types = prompt_types[1:]
     c_v = c_v[1:]
-    
-    # Track deployed prompts and their locations
     deployment = {}
     
     while i < len(PrC) + 1:
@@ -111,26 +96,22 @@ def scbb_l(G, S, Q, X, ai_sr):
         Sub_Path = []
         best_n = None
         
-        # Try subsequences of length m starting at index i
         for m in range(1, len(PrC) - i + 2):
             kappa = PrC[i-1:i-1+m]
             kappa_types = prompt_types[i-1:i-1+m]
             kappa_c_v = c_v[i-1:i-1+m]
             
             for n in S:
-                # Check if PES n can host all prompts in kappa (prompt types and capacity)
                 can_host = all(pt in G.nodes[n]['prompt_types'] for pt in kappa_types)
                 total_comp = sum(kappa_c_v)
                 if n != n_last:
-                    total_comp += VPEP_COMP_DEMAND  # For vPEP if needed
+                    total_comp += VPEP_COMP_DEMAND
                 if not can_host or total_comp > remaining_capacity[n]:
                     continue
                 
-                # Compute T_add
                 if n == n_last:
                     T_add = sum(c * COMP_LATENCY_PER_CORE for c in kappa_c_v)
                 else:
-                    # Compute PEP-based verification latency
                     pep_latencies = []
                     for q in Q:
                         try:
@@ -143,7 +124,6 @@ def scbb_l(G, S, Q, X, ai_sr):
                         except nx.NetworkXNoPath:
                             continue
                     
-                    # Compute vPEP-based verification latency
                     try:
                         path_direct = nx.shortest_path(G, n_last, n, weight='weight')
                         trans_direct = compute_transmission_latency(G, path_direct, d_v[i-2], BW)
@@ -151,11 +131,9 @@ def scbb_l(G, S, Q, X, ai_sr):
                     except nx.NetworkXNoPath:
                         vpep_latency = float('inf')
                     
-                    # Take the minimum verification latency
                     min_verify_latency = min(pep_latencies + [vpep_latency]) if pep_latencies else vpep_latency
                     T_add = min_verify_latency + sum(c * COMP_LATENCY_PER_CORE for c in kappa_c_v)
                 
-                # Compute VLB
                 VLB = T_add / m
                 if VLB < temp_T:
                     temp_T = VLB
@@ -167,7 +145,6 @@ def scbb_l(G, S, Q, X, ai_sr):
                         if min_verify_latency == vpep_latency:
                             Sub_Path = path_direct
                         else:
-                            # Find the PEP that gave the minimum latency
                             for q in Q:
                                 path_to_q = nx.shortest_path(G, n_last, q, weight='weight')
                                 path_from_q = nx.shortest_path(G, q, n, weight='weight')
@@ -177,27 +154,24 @@ def scbb_l(G, S, Q, X, ai_sr):
                                     Sub_Path = path_to_q[:-1] + path_from_q
                                     break
         
-        if not temp_k:  # No feasible deployment found
+        if not temp_k:
             return None, float('inf'), {}
         
-        # Update deployment and resources
         for idx, p in enumerate(temp_k):
             deployment[p] = best_n
             remaining_capacity[best_n] -= c_v[i-1+idx]
         if best_n != n_last:
-            remaining_capacity[n_last] -= VPEP_COMP_DEMAND  # For vPEP
+            remaining_capacity[n_last] -= VPEP_COMP_DEMAND
         
         i += len(temp_k)
         For_Path.extend(Sub_Path[1:] if Sub_Path[0] == n_last else Sub_Path)
         n_last = best_n
     
-    # Connect to AIGC server
     min_latency = float('inf')
     best_x = None
     final_path = []
     for x in X:
         try:
-            # Try vPEP
             path_direct = nx.shortest_path(G, n_last, x, weight='weight')
             trans_direct = compute_transmission_latency(G, path_direct, d_v[-1], BW)
             vpep_latency = VPEP_VERIFY_LATENCY * d_v[-1] + trans_direct
@@ -206,7 +180,6 @@ def scbb_l(G, S, Q, X, ai_sr):
                 best_x = x
                 final_path = path_direct
             
-            # Try PEP
             for q in Q:
                 path_to_q = nx.shortest_path(G, n_last, q, weight='weight')
                 path_from_q = nx.shortest_path(G, q, x, weight='weight')
@@ -224,20 +197,16 @@ def scbb_l(G, S, Q, X, ai_sr):
         return None, float('inf'), deployment
     
     For_Path.extend(final_path[1:] if final_path[0] == n_last else final_path)
-    deployment[PrC[-1]] = best_x  # Last prompt goes to AIGC server
+    deployment[PrC[-1]] = best_x
     
-    # Compute total latency
     total_latency = 0
     for idx, p in enumerate(PrC):
         n = deployment[p]
-        # Computation latency
         total_latency += c_v[idx] * COMP_LATENCY_PER_CORE
-        # Transmission and verification latency
         if idx == 0:
             continue
         prev_n = deployment[PrC[idx-1]]
         if n != prev_n:
-            # Find the path used
             path = []
             for j in range(len(For_Path)):
                 if For_Path[j] == prev_n:
@@ -247,7 +216,6 @@ def scbb_l(G, S, Q, X, ai_sr):
                             break
                     break
             trans_latency = compute_transmission_latency(G, path, d_v[idx-1], BW)
-            # Check if path goes through a PEP
             uses_pep = any(node in Q for node in path[1:-1])
             if uses_pep:
                 verify_latency = PEP_VERIFY_LATENCY
@@ -269,12 +237,11 @@ def pcdo(G, S, X, ai_sr):
     remaining_capacity = {n: G.nodes[n]['capacity'] for n in S}
     deployment = {}
     For_Path = [source]
-    PrC = PrC[1:]  # Remove p_0
+    PrC = PrC[1:]
     d_v = d_v[1:]
     prompt_types = prompt_types[1:]
     c_v = c_v[1:]
     
-    # Greedy deployment: assign each prompt to the closest PES with capacity
     current = source
     for idx, p in enumerate(PrC):
         pt = prompt_types[idx]
@@ -302,7 +269,6 @@ def pcdo(G, S, X, ai_sr):
         For_Path.extend(path[1:] if path[0] == current else path)
         current = best_n
     
-    # Connect to AIGC server
     min_dist = float('inf')
     best_x = None
     final_path = []
@@ -322,7 +288,6 @@ def pcdo(G, S, X, ai_sr):
     For_Path.extend(final_path[1:] if final_path[0] == current else final_path)
     deployment[PrC[-1]] = best_x
     
-    # Compute total latency (no verification)
     total_latency = 0
     for idx, p in enumerate(PrC):
         total_latency += c_v[idx] * COMP_LATENCY_PER_CORE
@@ -339,7 +304,6 @@ def pcdo(G, S, X, ai_sr):
 
 # --- PCDF Implementation (PCDO + Least-Latency Verification) ---
 def pcdf(G, S, Q, X, ai_sr):
-    # First run PCDO to get the deployment path and deployment
     For_Path, _, deployment = pcdo(G, S, X, ai_sr)
     if For_Path is None:
         return None, float('inf')
@@ -349,7 +313,6 @@ def pcdf(G, S, Q, X, ai_sr):
     BW = ai_sr['BW']
     c_v = ai_sr['c_v'][1:]
     
-    # Add verification: for each inter-PES transition, choose PEP or vPEP
     new_path = [For_Path[0]]
     total_latency = 0
     for idx, p in enumerate(PrC):
@@ -359,7 +322,6 @@ def pcdf(G, S, Q, X, ai_sr):
         prev_n = deployment[PrC[idx-1]]
         n = deployment[p]
         if n != prev_n:
-            # Choose between PEP and vPEP
             pep_latencies = []
             for q in Q:
                 try:
@@ -385,7 +347,6 @@ def pcdf(G, S, Q, X, ai_sr):
             total_latency += latency
             new_path.extend(path[1:] if path[0] == new_path[-1] else path)
     
-    # Connect to AIGC server (already handled by PCDO, just recompute latency)
     current = new_path[-1]
     for x in X:
         if x in For_Path:
@@ -411,7 +372,7 @@ def run_experiment():
         runtimes = {'SCBB-L': [], 'PCDO': [], 'PCDF': []}
         
         for sr_idx in range(NUM_AI_SRS_PER_NETWORK):
-            if (sr_idx + 1) % 500 == 0:  # Update every 500 AI-SRs
+            if (sr_idx + 1) % 500 == 0:
                 print(f"  Network {network_idx + 1}: Processed {sr_idx + 1}/{NUM_AI_SRS_PER_NETWORK} AI-SRs")
             ai_sr = generate_ai_sr(G, S)
             
@@ -447,6 +408,7 @@ def run_experiment():
     
     # Compute final metrics
     print("\nFinal Results:")
+    metrics = {}
     for method in results:
         total_requests = NUM_NETWORKS * NUM_AI_SRS_PER_NETWORK
         acceptance_ratio = results[method]['accepted'] / total_requests
@@ -456,6 +418,45 @@ def run_experiment():
         print(f"  Acceptance Ratio: {acceptance_ratio:.4f}")
         print(f"  Average Latency: {avg_latency:.4f} ms")
         print(f"  Average Runtime: {avg_runtime:.4f} ms")
+        metrics[method] = {
+            'acceptance_ratio': acceptance_ratio,
+            'avg_latency': avg_latency,
+            'avg_runtime': avg_runtime
+        }
+    
+    # Visualize the results
+    methods = list(metrics.keys())
+    acceptance_ratios = [metrics[m]['acceptance_ratio'] for m in methods]
+    avg_latencies = [metrics[m]['avg_latency'] for m in methods]
+    avg_runtimes = [metrics[m]['avg_runtime'] for m in methods]
+    
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+    
+    # Acceptance Ratio
+    ax1.bar(methods, acceptance_ratios, color=['#1f77b4', '#ff7f0e', '#2ca02c'])
+    ax1.set_title('Acceptance Ratio')
+    ax1.set_ylim(0, 1)
+    ax1.set_ylabel('Ratio')
+    for i, v in enumerate(acceptance_ratios):
+        ax1.text(i, v + 0.02, f'{v:.4f}', ha='center')
+    
+    # Average Latency
+    ax2.bar(methods, avg_latencies, color=['#1f77b4', '#ff7f0e', '#2ca02c'])
+    ax2.set_title('Average Latency')
+    ax2.set_ylabel('Latency (ms)')
+    for i, v in enumerate(avg_latencies):
+        ax2.text(i, v + 0.01, f'{v:.4f}', ha='center')
+    
+    # Average Runtime
+    ax3.bar(methods, avg_runtimes, color=['#1f77b4', '#ff7f0e', '#2ca02c'])
+    ax3.set_title('Average Runtime')
+    ax3.set_ylabel('Runtime (ms)')
+    for i, v in enumerate(avg_runtimes):
+        ax3.text(i, v + 0.1, f'{v:.4f}', ha='center')
+    
+    plt.tight_layout()
+    plt.savefig('performance_metrics.png', dpi=300, bbox_inches='tight')
+    plt.show()
 
 if __name__ == "__main__":
     run_experiment()
