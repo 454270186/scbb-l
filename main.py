@@ -20,7 +20,7 @@ BANDWIDTH_DEMAND = [1, 2, 3, 4, 5]  # Mbps
 COMP_LATENCY_PER_CORE = 0.01  # ms/CPU core
 PEP_VERIFY_LATENCY = 0.5  # ms
 VPEP_VERIFY_LATENCY = 0.02  # ms/Mbps
-NUM_NETWORKS = 10
+NUM_NETWORKS = 80
 NUM_AI_SRS_PER_NETWORK = 4000
 
 # --- Helper Functions ---
@@ -32,7 +32,6 @@ def generate_network():
     X = nodes[:NUM_AIGC_SERVERS]
     Q = nodes[NUM_AIGC_SERVERS:NUM_AIGC_SERVERS + num_peps]
     S = nodes[NUM_AIGC_SERVERS + num_peps:]
-    
     for node in G.nodes:
         if node in S:
             G.nodes[node]['type'] = 'PES'
@@ -42,11 +41,9 @@ def generate_network():
             G.nodes[node]['type'] = 'PEP'
         else:
             G.nodes[node]['type'] = 'AIGC'
-    
     for u, v in G.edges():
         G.edges[u, v]['bandwidth'] = random.choice(LINK_BANDWIDTHS)
         G.edges[u, v]['weight'] = random.uniform(*LINK_WEIGHTS)
-    
     return G, S, Q, X
 
 def generate_ai_sr(G, S):
@@ -57,7 +54,7 @@ def generate_ai_sr(G, S):
     prompt_types = [random.randint(1, 7) for _ in PrC]
     c_v = [random.uniform(*PROMPT_COMP_DEMAND) for _ in PrC]
     source = random.choice(S)
-    return {'PrC': PrC, 'd_v': d_v, 'BW': BW, 'prompt_types': prompt_types, 'c_v': c_v, 'source': source}
+    return {'PrC': PrC, 'd_v': d_v, 'BW': BW, 'prompt_types': prompt_types, 'c_v': c_v, 'source': source, 'length': chain_length}
 
 def compute_transmission_latency(G, path, d_v, BW):
     if not path:
@@ -360,103 +357,125 @@ def pcdf(G, S, Q, X, ai_sr):
 
 # --- Main Experiment ---
 def run_experiment():
-    results = {'SCBB-L': {'latency': [], 'accepted': 0, 'runtime': []},
-               'PCDO': {'latency': [], 'accepted': 0, 'runtime': []},
-               'PCDF': {'latency': [], 'accepted': 0, 'runtime': []}}
+    # Results dictionary: {method: {length: {metric: value}}}
+    results = {
+        'SCBB-L': {length: {'latency': [], 'accepted': 0, 'total': 0, 'runtime': []} for length in range(3, 8)},
+        'PCDO': {length: {'latency': [], 'accepted': 0, 'total': 0, 'runtime': []} for length in range(3, 8)},
+        'PCDF': {length: {'latency': [], 'accepted': 0, 'total': 0, 'runtime': []} for length in range(3, 8)}
+    }
     
     for network_idx in range(NUM_NETWORKS):
         print(f"Processing Network {network_idx + 1}/{NUM_NETWORKS}...")
         G, S, Q, X = generate_network()
-        accepted = {'SCBB-L': 0, 'PCDO': 0, 'PCDF': 0}
-        latencies = {'SCBB-L': [], 'PCDO': [], 'PCDF': []}
-        runtimes = {'SCBB-L': [], 'PCDO': [], 'PCDF': []}
         
         for sr_idx in range(NUM_AI_SRS_PER_NETWORK):
             if (sr_idx + 1) % 500 == 0:
                 print(f"  Network {network_idx + 1}: Processed {sr_idx + 1}/{NUM_AI_SRS_PER_NETWORK} AI-SRs")
             ai_sr = generate_ai_sr(G, S)
+            chain_length = ai_sr['length']
             
             # Run SCBB-L
             start_time = time.time()
             path, latency, _ = scbb_l(G, S, Q, X, ai_sr)
-            runtimes['SCBB-L'].append(time.time() - start_time)
+            runtime = time.time() - start_time
+            results['SCBB-L'][chain_length]['total'] += 1
+            results['SCBB-L'][chain_length]['runtime'].append(runtime)
             if path is not None:
-                accepted['SCBB-L'] += 1
-                latencies['SCBB-L'].append(latency)
+                results['SCBB-L'][chain_length]['accepted'] += 1
+                results['SCBB-L'][chain_length]['latency'].append(latency)
             
             # Run PCDO
             start_time = time.time()
             path, latency, _ = pcdo(G, S, X, ai_sr)
-            runtimes['PCDO'].append(time.time() - start_time)
+            runtime = time.time() - start_time
+            results['PCDO'][chain_length]['total'] += 1
+            results['PCDO'][chain_length]['runtime'].append(runtime)
             if path is not None:
-                accepted['PCDO'] += 1
-                latencies['PCDO'].append(latency)
+                results['PCDO'][chain_length]['accepted'] += 1
+                results['PCDO'][chain_length]['latency'].append(latency)
             
             # Run PCDF
             start_time = time.time()
             path, latency = pcdf(G, S, Q, X, ai_sr)
-            runtimes['PCDF'].append(time.time() - start_time)
+            runtime = time.time() - start_time
+            results['PCDF'][chain_length]['total'] += 1
+            results['PCDF'][chain_length]['runtime'].append(runtime)
             if path is not None:
-                accepted['PCDF'] += 1
-                latencies['PCDF'].append(latency)
-        
-        # Aggregate results for this network
-        for method in results:
-            results[method]['accepted'] += accepted[method]
-            results[method]['latency'].extend(latencies[method])
-            results[method]['runtime'].extend(runtimes[method])
+                results['PCDF'][chain_length]['accepted'] += 1
+                results['PCDF'][chain_length]['latency'].append(latency)
     
-    # Compute final metrics
-    print("\nFinal Results:")
-    metrics = {}
+    # Compute average metrics for each method and chain length
+    metrics = {'latency': {}, 'acceptance_ratio': {}, 'runtime': {}}
     for method in results:
-        total_requests = NUM_NETWORKS * NUM_AI_SRS_PER_NETWORK
-        acceptance_ratio = results[method]['accepted'] / total_requests
-        avg_latency = np.mean(results[method]['latency']) if results[method]['latency'] else float('inf')
-        avg_runtime = np.mean(results[method]['runtime']) * 1000  # Convert to ms
+        metrics['latency'][method] = []
+        metrics['acceptance_ratio'][method] = []
+        metrics['runtime'][method] = []
+        for length in range(3, 8):
+            data = results[method][length]
+            # Average latency
+            avg_latency = np.mean(data['latency']) if data['latency'] else float('inf')
+            metrics['latency'][method].append(avg_latency)
+            # Acceptance ratio
+            acceptance_ratio = data['accepted'] / data['total'] if data['total'] > 0 else 0
+            metrics['acceptance_ratio'][method].append(acceptance_ratio)
+            # Average runtime (in ms)
+            avg_runtime = np.mean(data['runtime']) * 1000 if data['runtime'] else float('inf')
+            metrics['runtime'][method].append(avg_runtime)
+    
+    # Print final results
+    print("\nFinal Results:")
+    for method in results:
         print(f"{method}:")
-        print(f"  Acceptance Ratio: {acceptance_ratio:.4f}")
-        print(f"  Average Latency: {avg_latency:.4f} ms")
-        print(f"  Average Runtime: {avg_runtime:.4f} ms")
-        metrics[method] = {
-            'acceptance_ratio': acceptance_ratio,
-            'avg_latency': avg_latency,
-            'avg_runtime': avg_runtime
-        }
+        for length in range(3, 8):
+            print(f"  Chain Length {length}:")
+            print(f"    Average Latency: {metrics['latency'][method][length-3]:.4f} ms")
+            print(f"    Acceptance Ratio: {metrics['acceptance_ratio'][method][length-3]:.4f}")
+            print(f"    Average Runtime: {metrics['runtime'][method][length-3]:.4f} ms")
     
-    # Visualize the results
-    methods = list(metrics.keys())
-    acceptance_ratios = [metrics[m]['acceptance_ratio'] for m in methods]
-    avg_latencies = [metrics[m]['avg_latency'] for m in methods]
-    avg_runtimes = [metrics[m]['avg_runtime'] for m in methods]
+    # Generate visualizations
+    chain_lengths = list(range(3, 8))
+    methods = ['SCBB-L', 'PCDO', 'PCDF']
+    bar_width = 0.25
+    index = np.arange(len(chain_lengths))
     
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
-    
-    # Acceptance Ratio
-    ax1.bar(methods, acceptance_ratios, color=['#1f77b4', '#ff7f0e', '#2ca02c'])
-    ax1.set_title('Acceptance Ratio')
-    ax1.set_ylim(0, 1)
-    ax1.set_ylabel('Ratio')
-    for i, v in enumerate(acceptance_ratios):
-        ax1.text(i, v + 0.02, f'{v:.4f}', ha='center')
-    
-    # Average Latency
-    ax2.bar(methods, avg_latencies, color=['#1f77b4', '#ff7f0e', '#2ca02c'])
-    ax2.set_title('Average Latency')
-    ax2.set_ylabel('Latency (ms)')
-    for i, v in enumerate(avg_latencies):
-        ax2.text(i, v + 0.01, f'{v:.4f}', ha='center')
-    
-    # Average Runtime
-    ax3.bar(methods, avg_runtimes, color=['#1f77b4', '#ff7f0e', '#2ca02c'])
-    ax3.set_title('Average Runtime')
-    ax3.set_ylabel('Runtime (ms)')
-    for i, v in enumerate(avg_runtimes):
-        ax3.text(i, v + 0.1, f'{v:.4f}', ha='center')
-    
+    # Plot 1: Average Latency
+    plt.figure(figsize=(10, 6))
+    for i, method in enumerate(methods):
+        plt.bar(index + i * bar_width, metrics['latency'][method], bar_width, label=method)
+    plt.xlabel('Prompt Chain Length')
+    plt.ylabel('Average Latency (ms)')
+    plt.title('Average Latency by Prompt Chain Length')
+    plt.xticks(index + bar_width, chain_lengths)
+    plt.legend()
     plt.tight_layout()
-    plt.savefig('performance_metrics.png', dpi=300, bbox_inches='tight')
-    plt.show()
+    plt.savefig('latency_comparison.png')
+    plt.close()
+    
+    # Plot 2: Acceptance Ratio
+    plt.figure(figsize=(10, 6))
+    for i, method in enumerate(methods):
+        plt.bar(index + i * bar_width, metrics['acceptance_ratio'][method], bar_width, label=method)
+    plt.xlabel('Prompt Chain Length')
+    plt.ylabel('Acceptance Ratio')
+    plt.title('Acceptance Ratio by Prompt Chain Length')
+    plt.xticks(index + bar_width, chain_lengths)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('acceptance_ratio_comparison.png')
+    plt.close()
+    
+    # Plot 3: Average Runtime
+    plt.figure(figsize=(10, 6))
+    for i, method in enumerate(methods):
+        plt.bar(index + i * bar_width, metrics['runtime'][method], bar_width, label=method)
+    plt.xlabel('Prompt Chain Length')
+    plt.ylabel('Average Runtime (ms)')
+    plt.title('Average Runtime by Prompt Chain Length')
+    plt.xticks(index + bar_width, chain_lengths)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('runtime_comparison.png')
+    plt.close()
 
 if __name__ == "__main__":
     run_experiment()
