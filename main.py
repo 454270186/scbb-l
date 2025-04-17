@@ -6,22 +6,26 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 
 # --- Constants and Parameters ---
-NUM_NODES = 20  # NY-20 topology
+NUM_NODES = 20
 NUM_AIGC_SERVERS = 4
 NUM_PEPS_RANGE = (1, 4)
-PES_CAPACITIES = [1000, 1250, 1500, 1750, 2000]  # CPU cores
+PES_CAPACITIES = [1000, 1250, 1500, 1750, 2000]
 MAX_PROMPT_TYPES_PER_PES = 4
-LINK_BANDWIDTHS = [10, 20, 30, 40]  # Gbps
-LINK_WEIGHTS = (5, 20)  # Range for link weights
-PROMPT_CHAIN_LENGTHS = (3, 7)  # 3 to 7 prompts
-PROMPT_COMP_DEMAND = (0.5, 0.8)  # CPU cores
-VPEP_COMP_DEMAND = 0.6  # CPU cores
-BANDWIDTH_DEMAND = [1, 2, 3, 4, 5]  # Mbps
-COMP_LATENCY_PER_CORE = 0.01  # ms/CPU core
-PEP_VERIFY_LATENCY = 0.5  # ms
-VPEP_VERIFY_LATENCY = 0.02  # ms/Mbps
-NUM_NETWORKS = 80
-NUM_AI_SRS_PER_NETWORK = 4000
+LINK_BANDWIDTHS = [10, 20, 30, 40]
+LINK_WEIGHTS = (5, 20)
+
+MIN_PROMPT_CHAIN_LENGTH = 3
+MAX_PROMPT_CHAIN_LENGTH = 15
+PROMPT_CHAIN_LENGTHS = (MIN_PROMPT_CHAIN_LENGTH, MAX_PROMPT_CHAIN_LENGTH)
+
+PROMPT_COMP_DEMAND = (0.5, 0.8)
+VPEP_COMP_DEMAND = 0.6
+BANDWIDTH_DEMAND = [1, 2, 3, 4, 5]
+COMP_LATENCY_PER_CORE = 0.01
+PEP_VERIFY_LATENCY = 0.5
+VPEP_VERIFY_LATENCY = 0.02
+NUM_NETWORKS = 10
+NUM_AI_SRS_PER_NETWORK = 1000
 
 # --- Helper Functions ---
 def generate_network():
@@ -152,7 +156,7 @@ def scbb_l(G, S, Q, X, ai_sr):
                                     break
         
         if not temp_k:
-            return None, float('inf'), {}
+            return None, float('inf'), {}, 0, 0, remaining_capacity
         
         for idx, p in enumerate(temp_k):
             deployment[p] = best_n
@@ -191,12 +195,14 @@ def scbb_l(G, S, Q, X, ai_sr):
             continue
     
     if best_x is None:
-        return None, float('inf'), deployment
+        return None, float('inf'), deployment, 0, 0, remaining_capacity
     
     For_Path.extend(final_path[1:] if final_path[0] == n_last else final_path)
     deployment[PrC[-1]] = best_x
     
     total_latency = 0
+    verification_latency = 0
+    num_verification_steps = 0
     for idx, p in enumerate(PrC):
         n = deployment[p]
         total_latency += c_v[idx] * COMP_LATENCY_PER_CORE
@@ -219,8 +225,10 @@ def scbb_l(G, S, Q, X, ai_sr):
             else:
                 verify_latency = VPEP_VERIFY_LATENCY * d_v[idx-1]
             total_latency += trans_latency + verify_latency
+            verification_latency += verify_latency
+            num_verification_steps += 1
     
-    return For_Path, total_latency, deployment
+    return For_Path, total_latency, deployment, verification_latency, num_verification_steps, remaining_capacity
 
 # --- PCDO Implementation (No ZT Verification) ---
 def pcdo(G, S, X, ai_sr):
@@ -258,7 +266,7 @@ def pcdo(G, S, X, ai_sr):
                 continue
         
         if best_n is None:
-            return None, float('inf'), deployment
+            return None, float('inf'), deployment, 0, 0, remaining_capacity
         
         deployment[p] = best_n
         remaining_capacity[best_n] -= c_v[idx]
@@ -280,7 +288,7 @@ def pcdo(G, S, X, ai_sr):
             continue
     
     if best_x is None:
-        return None, float('inf'), deployment
+        return None, float('inf'), deployment, 0, 0, remaining_capacity
     
     For_Path.extend(final_path[1:] if final_path[0] == current else final_path)
     deployment[PrC[-1]] = best_x
@@ -297,13 +305,13 @@ def pcdo(G, S, X, ai_sr):
             trans_latency = compute_transmission_latency(G, path, d_v[idx-1], BW)
             total_latency += trans_latency
     
-    return For_Path, total_latency, deployment
+    return For_Path, total_latency, deployment, 0, 0, remaining_capacity
 
 # --- PCDF Implementation (PCDO + Least-Latency Verification) ---
 def pcdf(G, S, Q, X, ai_sr):
-    For_Path, _, deployment = pcdo(G, S, X, ai_sr)
+    For_Path, _, deployment, _, _, remaining_capacity = pcdo(G, S, X, ai_sr)
     if For_Path is None:
-        return None, float('inf')
+        return None, float('inf'), 0, 0
     
     PrC = ai_sr['PrC'][1:]
     d_v = ai_sr['d_v'][1:]
@@ -312,6 +320,8 @@ def pcdf(G, S, Q, X, ai_sr):
     
     new_path = [For_Path[0]]
     total_latency = 0
+    verification_latency = 0
+    num_verification_steps = 0
     for idx, p in enumerate(PrC):
         total_latency += c_v[idx] * COMP_LATENCY_PER_CORE
         if idx == 0:
@@ -337,11 +347,15 @@ def pcdf(G, S, Q, X, ai_sr):
             
             if pep_latencies and min(pep_latencies, key=lambda x: x[0])[0] < vpep_latency:
                 latency, path = min(pep_latencies, key=lambda x: x[0])
+                verify_latency = PEP_VERIFY_LATENCY
             else:
                 latency = vpep_latency
+                verify_latency = VPEP_VERIFY_LATENCY * d_v[idx-1]
                 path = path_direct
             
             total_latency += latency
+            verification_latency += verify_latency
+            num_verification_steps += 1
             new_path.extend(path[1:] if path[0] == new_path[-1] else path)
     
     current = new_path[-1]
@@ -351,17 +365,25 @@ def pcdf(G, S, Q, X, ai_sr):
             trans_direct = compute_transmission_latency(G, path, d_v[-1], BW)
             vpep_latency = VPEP_VERIFY_LATENCY * d_v[-1] + trans_direct
             total_latency += vpep_latency
+            verification_latency += VPEP_VERIFY_LATENCY * d_v[-1]
+            num_verification_steps += 1
             break
     
-    return new_path, total_latency
+    return new_path, total_latency, verification_latency, num_verification_steps
 
 # --- Main Experiment ---
 def run_experiment():
     # Results dictionary: {method: {length: {metric: value}}}
     results = {
-        'SCBB-L': {length: {'latency': [], 'accepted': 0, 'total': 0, 'runtime': []} for length in range(3, 8)},
-        'PCDO': {length: {'latency': [], 'accepted': 0, 'total': 0, 'runtime': []} for length in range(3, 8)},
-        'PCDF': {length: {'latency': [], 'accepted': 0, 'total': 0, 'runtime': []} for length in range(3, 8)}
+        'SCBB-L': {length: {'latency': [], 'accepted': 0, 'total': 0, 'runtime': [], 
+                             'verification_latency': [], 'verification_steps': [], 
+                             'path_length': [], 'resource_utilization': []} for length in range(MIN_PROMPT_CHAIN_LENGTH, MAX_PROMPT_CHAIN_LENGTH+1)},
+        'PCDO': {length: {'latency': [], 'accepted': 0, 'total': 0, 'runtime': [], 
+                          'verification_latency': [], 'verification_steps': [], 
+                          'path_length': [], 'resource_utilization': []} for length in range(MIN_PROMPT_CHAIN_LENGTH, MAX_PROMPT_CHAIN_LENGTH+1)},
+        'PCDF': {length: {'latency': [], 'accepted': 0, 'total': 0, 'runtime': [], 
+                          'verification_latency': [], 'verification_steps': [], 
+                          'path_length': [], 'resource_utilization': []} for length in range(MIN_PROMPT_CHAIN_LENGTH, MAX_PROMPT_CHAIN_LENGTH+1)}
     }
     
     for network_idx in range(NUM_NETWORKS):
@@ -376,41 +398,76 @@ def run_experiment():
             
             # Run SCBB-L
             start_time = time.time()
-            path, latency, _ = scbb_l(G, S, Q, X, ai_sr)
+            path, latency, _, verif_latency, verif_steps, remaining_capacity = scbb_l(G, S, Q, X, ai_sr)
             runtime = time.time() - start_time
             results['SCBB-L'][chain_length]['total'] += 1
             results['SCBB-L'][chain_length]['runtime'].append(runtime)
             if path is not None:
                 results['SCBB-L'][chain_length]['accepted'] += 1
                 results['SCBB-L'][chain_length]['latency'].append(latency)
+                results['SCBB-L'][chain_length]['verification_latency'].append(verif_latency)
+                results['SCBB-L'][chain_length]['verification_steps'].append(verif_steps)
+                results['SCBB-L'][chain_length]['path_length'].append(len(path) - 1)  # Number of hops
+                # Compute resource utilization efficiency (coefficient of variation)
+                used_capacity = [G.nodes[n]['capacity'] - remaining_capacity[n] for n in S]
+                mean_capacity = np.mean(used_capacity) if used_capacity else 0
+                std_capacity = np.std(used_capacity) if used_capacity else 0
+                cv = std_capacity / mean_capacity if mean_capacity > 0 else float('inf')
+                results['SCBB-L'][chain_length]['resource_utilization'].append(cv)
             
             # Run PCDO
             start_time = time.time()
-            path, latency, _ = pcdo(G, S, X, ai_sr)
+            path, latency, _, verif_latency, verif_steps, remaining_capacity = pcdo(G, S, X, ai_sr)
             runtime = time.time() - start_time
             results['PCDO'][chain_length]['total'] += 1
             results['PCDO'][chain_length]['runtime'].append(runtime)
             if path is not None:
                 results['PCDO'][chain_length]['accepted'] += 1
                 results['PCDO'][chain_length]['latency'].append(latency)
+                results['PCDO'][chain_length]['verification_latency'].append(verif_latency)
+                results['PCDO'][chain_length]['verification_steps'].append(verif_steps)
+                results['PCDO'][chain_length]['path_length'].append(len(path) - 1)
+                used_capacity = [G.nodes[n]['capacity'] - remaining_capacity[n] for n in S]
+                mean_capacity = np.mean(used_capacity) if used_capacity else 0
+                std_capacity = np.std(used_capacity) if used_capacity else 0
+                cv = std_capacity / mean_capacity if mean_capacity > 0 else float('inf')
+                results['PCDO'][chain_length]['resource_utilization'].append(cv)
             
             # Run PCDF
             start_time = time.time()
-            path, latency = pcdf(G, S, Q, X, ai_sr)
+            path, latency, verif_latency, verif_steps = pcdf(G, S, Q, X, ai_sr)
             runtime = time.time() - start_time
             results['PCDF'][chain_length]['total'] += 1
             results['PCDF'][chain_length]['runtime'].append(runtime)
             if path is not None:
                 results['PCDF'][chain_length]['accepted'] += 1
                 results['PCDF'][chain_length]['latency'].append(latency)
+                results['PCDF'][chain_length]['verification_latency'].append(verif_latency)
+                results['PCDF'][chain_length]['verification_steps'].append(verif_steps)
+                results['PCDF'][chain_length]['path_length'].append(len(path) - 1)
+                # Resource utilization: re-run pcdo to get remaining capacity
+                _, _, _, _, _, remaining_capacity = pcdo(G, S, X, ai_sr)
+                used_capacity = [G.nodes[n]['capacity'] - remaining_capacity[n] for n in S]
+                mean_capacity = np.mean(used_capacity) if used_capacity else 0
+                std_capacity = np.std(used_capacity) if used_capacity else 0
+                cv = std_capacity / mean_capacity if mean_capacity > 0 else float('inf')
+                results['PCDF'][chain_length]['resource_utilization'].append(cv)
     
     # Compute average metrics for each method and chain length
-    metrics = {'latency': {}, 'acceptance_ratio': {}, 'runtime': {}}
+    metrics = {
+        'latency': {}, 'acceptance_ratio': {}, 'runtime': {}, 
+        'verification_overhead': {}, 'verification_steps': {},
+        'path_length': {}, 'resource_utilization': {}
+    }
     for method in results:
         metrics['latency'][method] = []
         metrics['acceptance_ratio'][method] = []
         metrics['runtime'][method] = []
-        for length in range(3, 8):
+        metrics['verification_overhead'][method] = []
+        metrics['verification_steps'][method] = []
+        metrics['path_length'][method] = []
+        metrics['resource_utilization'][method] = []
+        for length in range(MIN_PROMPT_CHAIN_LENGTH, MAX_PROMPT_CHAIN_LENGTH+1):
             data = results[method][length]
             # Average latency
             avg_latency = np.mean(data['latency']) if data['latency'] else float('inf')
@@ -421,20 +478,40 @@ def run_experiment():
             # Average runtime (in ms)
             avg_runtime = np.mean(data['runtime']) * 1000 if data['runtime'] else float('inf')
             metrics['runtime'][method].append(avg_runtime)
+            # Verification overhead ratio
+            verif_overhead = []
+            for lat, verif_lat in zip(data['latency'], data['verification_latency']):
+                if lat > 0:
+                    verif_overhead.append(verif_lat / lat)
+            avg_verif_overhead = np.mean(verif_overhead) if verif_overhead else 0
+            metrics['verification_overhead'][method].append(avg_verif_overhead)
+            # Average number of verification steps
+            avg_verif_steps = np.mean(data['verification_steps']) if data['verification_steps'] else 0
+            metrics['verification_steps'][method].append(avg_verif_steps)
+            # Average path length (hops)
+            avg_path_length = np.mean(data['path_length']) if data['path_length'] else float('inf')
+            metrics['path_length'][method].append(avg_path_length)
+            # Average resource utilization efficiency (coefficient of variation)
+            avg_resource_util = np.mean(data['resource_utilization']) if data['resource_utilization'] else float('inf')
+            metrics['resource_utilization'][method].append(avg_resource_util)
     
     # Print final results
     print("\nFinal Results:")
     for method in results:
         print(f"{method}:")
-        for length in range(3, 8):
+        for length in range(MIN_PROMPT_CHAIN_LENGTH, MAX_PROMPT_CHAIN_LENGTH+1):
             print(f"  Chain Length {length}:")
-            print(f"    Average Latency: {metrics['latency'][method][length-3]:.4f} ms")
-            print(f"    Acceptance Ratio: {metrics['acceptance_ratio'][method][length-3]:.4f}")
-            print(f"    Average Runtime: {metrics['runtime'][method][length-3]:.4f} ms")
+            print(f"    Average Latency: {metrics['latency'][method][length-MIN_PROMPT_CHAIN_LENGTH]:.4f} ms")
+            print(f"    Acceptance Ratio: {metrics['acceptance_ratio'][method][length-MIN_PROMPT_CHAIN_LENGTH]:.4f}")
+            print(f"    Average Runtime: {metrics['runtime'][method][length-MIN_PROMPT_CHAIN_LENGTH]:.4f} ms")
+            print(f"    Verification Overhead Ratio: {metrics['verification_overhead'][method][length-MIN_PROMPT_CHAIN_LENGTH]:.4f}")
+            print(f"    Average Verification Steps: {metrics['verification_steps'][method][length-MIN_PROMPT_CHAIN_LENGTH]:.2f}")
+            print(f"    Average Path Length (Hops): {metrics['path_length'][method][length-MIN_PROMPT_CHAIN_LENGTH]:.2f}")
+            print(f"    Resource Utilization Efficiency (CV): {metrics['resource_utilization'][method][length-MIN_PROMPT_CHAIN_LENGTH]:.4f}")
     
     # Generate visualizations
-    chain_lengths = list(range(3, 8))
-    methods = ['SCBB-L', 'PCDO', 'PCDF']
+    chain_lengths = list(range(MIN_PROMPT_CHAIN_LENGTH, MAX_PROMPT_CHAIN_LENGTH+1))
+    methods = ['PCDO', 'SCBB-L', 'PCDF']
     bar_width = 0.25
     index = np.arange(len(chain_lengths))
     
@@ -475,6 +552,58 @@ def run_experiment():
     plt.legend()
     plt.tight_layout()
     plt.savefig('runtime_comparison.png')
+    plt.close()
+    
+    # Plot 4: Verification Overhead Ratio
+    plt.figure(figsize=(10, 6))
+    for i, method in enumerate(methods):
+        plt.bar(index + i * bar_width, metrics['verification_overhead'][method], bar_width, label=method)
+    plt.xlabel('Prompt Chain Length')
+    plt.ylabel('Verification Overhead Ratio')
+    plt.title('Verification Overhead Ratio by Prompt Chain Length')
+    plt.xticks(index + bar_width, chain_lengths)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('verification_overhead_comparison.png')
+    plt.close()
+    
+    # Plot 5: Average Number of Verification Steps
+    plt.figure(figsize=(10, 6))
+    for i, method in enumerate(methods):
+        plt.bar(index + i * bar_width, metrics['verification_steps'][method], bar_width, label=method)
+    plt.xlabel('Prompt Chain Length')
+    plt.ylabel('Average Verification Steps')
+    plt.title('Average Number of Verification Steps by Prompt Chain Length')
+    plt.xticks(index + bar_width, chain_lengths)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('verification_steps_comparison.png')
+    plt.close()
+    
+    # Plot 6: Average Path Length (Hops)
+    plt.figure(figsize=(10, 6))
+    for i, method in enumerate(methods):
+        plt.bar(index + i * bar_width, metrics['path_length'][method], bar_width, label=method)
+    plt.xlabel('Prompt Chain Length')
+    plt.ylabel('Average Path Length (Hops)')
+    plt.title('Average Path Length by Prompt Chain Length')
+    plt.xticks(index + bar_width, chain_lengths)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('path_length_comparison.png')
+    plt.close()
+    
+    # Plot 7: Resource Utilization Efficiency (Coefficient of Variation)
+    plt.figure(figsize=(10, 6))
+    for i, method in enumerate(methods):
+        plt.bar(index + i * bar_width, metrics['resource_utilization'][method], bar_width, label=method)
+    plt.xlabel('Prompt Chain Length')
+    plt.ylabel('Resource Utilization Efficiency (CV)')
+    plt.title('Resource Utilization Efficiency by Prompt Chain Length')
+    plt.xticks(index + bar_width, chain_lengths)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('resource_utilization_comparison.png')
     plt.close()
 
 if __name__ == "__main__":
